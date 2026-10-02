@@ -37,6 +37,7 @@ const (
 	LocalNetworkName = "locnet"
 
 	// OVS Bridge Datapath types
+	DatapathSystem    = "system"
 	DatapathUserspace = "netdev"
 
 	// types.OVNClusterRouter is the name of the distributed router

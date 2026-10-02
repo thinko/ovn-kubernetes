@@ -48,7 +48,7 @@ var _ = Describe("cni_dpu tests", func() {
 				DeviceID: "",
 			},
 			timestamp:  time.Time{},
-			IsVFIO:     false,
+			DeviceType: DeviceTypeNone,
 			netName:    ovntypes.DefaultNetworkName,
 			nadName:    ovntypes.DefaultNetworkName,
 			nadKey:     ovntypes.DefaultNetworkName,

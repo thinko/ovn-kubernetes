@@ -113,10 +113,10 @@ func GetNicName(ovsClient libovsdbclient.Client, brName string) (string, error) 
 		return "", err
 	}
 
-	systemPorts := make([]string, 0)
+	systemOrDpdkPorts := make([]string, 0)
 	for port, ifaces := range portsToInterfaces {
 		for _, iface := range ifaces {
-			if iface.Type != "system" {
+			if iface.Type != "system" && iface.Type != "dpdk" {
 				continue
 			}
 			// On a DPU, host function representors are system-type ports too,
@@ -127,16 +127,16 @@ func GetNicName(ovsClient libovsdbclient.Client, brName string) (string, error) 
 					brName, iface.Name)
 				continue
 			}
-			systemPorts = append(systemPorts, port)
+			systemOrDpdkPorts = append(systemOrDpdkPorts, port)
 			// A port qualifies at most once, even when it carries several
 			// system interfaces (e.g. a bond).
 			break
 		}
 	}
-	if len(systemPorts) == 1 {
-		return systemPorts[0], nil
-	} else if len(systemPorts) > 1 {
-		klog.Infof("Found more than one system Type ports on the OVS bridge %s, so skipping "+
+	if len(systemOrDpdkPorts) == 1 {
+		return systemOrDpdkPorts[0], nil
+	} else if len(systemOrDpdkPorts) > 1 {
+		klog.Infof("Found more than one ports of type 'system' or 'dpdk' on the OVS bridge %s, so skipping "+
 			"this method of determining the uplink port", brName)
 	}
 
@@ -145,7 +145,7 @@ func GetNicName(ovsClient libovsdbclient.Client, brName string) (string, error) 
 		// changes got integrated. Assuming naming format of "br<nic name>".
 		return brName[len("br"):], nil
 	}
-	return "", fmt.Errorf("unable to resolve uplink for bridge %q: no system-typed port, no bridge-uplink external-id, and bridge name has no \"br\" prefix to strip", brName)
+	return "", fmt.Errorf("unable to resolve uplink for bridge %q: no system- or dpdk-typed port, no bridge-uplink external-id, and bridge name has no \"br\" prefix to strip", brName)
 }
 
 func saveIPAddress(oldLink, newLink netlink.Link, addrs []netlink.Addr) error {

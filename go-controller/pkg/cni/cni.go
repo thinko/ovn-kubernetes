@@ -143,8 +143,8 @@ func (pr *PodRequest) cmdAdd(kubeAuth *KubeAPIAuth, clientset *ClientSet, ovsCli
 	if pr.CNIConf.DeviceID != "" {
 		var err error
 
-		if !pr.IsVFIO {
-			netdevName, err = util.GetNetdevNameFromDeviceId(pr.CNIConf.DeviceID, pr.deviceInfo)
+		if pr.DeviceType.HasNetdev() {
+			netdevName, err = GetNetdevNameFromDeviceId(pr.CNIConf.DeviceID, pr.DeviceType)
 			if err != nil {
 				return nil, fmt.Errorf("failed in cmdAdd while getting Netdevice name: %w", err)
 			}
@@ -424,4 +424,13 @@ func checkBridgeMapping(ovsClient client.Client, topology string, networkName st
 	}
 	klog.V(5).Infof("Failed to find bridge mapping for network: %q, current OVN bridge-mappings: (%s)", networkName, ovnBridgeMappings)
 	return fmt.Errorf("failed to find OVN bridge-mapping for network: %q", networkName)
+}
+
+func (t DeviceType) HasNetdev() bool {
+	switch t {
+	case DeviceTypeVFNetdev, DeviceTypeSF, DeviceTypeVFVdpaVirtio:
+		return true
+	default:
+		return false
+	}
 }

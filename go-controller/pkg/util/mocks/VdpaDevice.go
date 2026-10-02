@@ -120,7 +120,7 @@ func (_m *VdpaDevice) VhostVdpa() kvdpa.VhostVdpa {
 }
 
 // VirtioNet provides a mock function with no fields
-func (_m *VdpaDevice) VirtioNet() kvdpa.VirtioNet {
+func (_m *VdpaDevice) VirtioNet() (kvdpa.VirtioNet, error) {
 	ret := _m.Called()
 
 	if len(ret) == 0 {
@@ -128,15 +128,18 @@ func (_m *VdpaDevice) VirtioNet() kvdpa.VirtioNet {
 	}
 
 	var r0 kvdpa.VirtioNet
-	if rf, ok := ret.Get(0).(func() kvdpa.VirtioNet); ok {
-		r0 = rf()
-	} else {
-		if ret.Get(0) != nil {
-			r0 = ret.Get(0).(kvdpa.VirtioNet)
-		}
+	var r1 error
+	if rf, ok := ret.Get(0).(func() (kvdpa.VirtioNet, error)); ok {
+		return rf()
+	}
+	if ret.Get(0) != nil {
+		r0 = ret.Get(0).(kvdpa.VirtioNet)
+	}
+	if ret.Get(1) != nil {
+		r1 = ret.Get(1).(error)
 	}
 
-	return r0
+	return r0, r1
 }
 
 // NewVdpaDevice creates a new instance of VdpaDevice. It also registers a testing interface on the mock and a cleanup function to assert the mocks expectations.

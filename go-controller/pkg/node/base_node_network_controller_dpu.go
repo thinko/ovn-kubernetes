@@ -278,7 +278,7 @@ func (bnnc *BaseNodeNetworkController) addRepPort(pod *corev1.Pod, dpuCD *util.D
 	}
 
 	klog.Infof("Adding VF representor %s for %s", vfRepName, podDesc)
-	err = cni.ConfigureOVS(context.TODO(), bnnc.ovsClient, pod.Namespace, pod.Name, "", vfRepName, ifInfo, dpuCD.SandboxId, deviceID, false, getter)
+	err = cni.ConfigureOVS(context.TODO(), bnnc.ovsClient, pod.Namespace, pod.Name, "", vfRepName, ifInfo, dpuCD.SandboxId, deviceID, getter, false, false, cni.DeviceTypeVFNetdev)
 	if err != nil {
 		// Note(adrianc): we are lenient with cleanup in this method as pod is going to be retried anyway.
 		_ = bnnc.delRepPort(pod, dpuCD, vfRepName, nadKey)

@@ -235,23 +235,9 @@ func cniRequestToPodRequest(cr *Request, ctx context.Context) (*PodRequest, erro
 }
 
 func updateDeviceInfo(pr *PodRequest) error {
-	if pr.CNIConf.DeviceID == "" {
-		return nil
-	}
-	if util.IsPCIDeviceName(pr.CNIConf.DeviceID) {
-		// DeviceID is a PCI address
-		pr.IsVFIO = util.GetSriovnetOps().IsVfPciVfioBound(pr.CNIConf.DeviceID)
-	} else if util.IsAuxDeviceName(pr.CNIConf.DeviceID) {
-		// DeviceID is an Auxiliary device name - <driver_name>.<kind_of_a_type>.<id>
-		chunks := strings.Split(pr.CNIConf.DeviceID, ".")
-		if len(chunks) < 2 {
-			return fmt.Errorf("invalid auxiliary device name %q: expected driver.<type>.<id>", pr.CNIConf.DeviceID)
-		}
-		if chunks[1] != "sf" {
-			return fmt.Errorf("only SF auxiliary devices are supported, device name %q is not supported", pr.CNIConf.DeviceID)
-		}
-	} // else it is a netdev name, which is used for simulated DPU environments.
-	return nil
+	var err error
+	pr.DeviceType, err = GetDeviceType(pr.CNIConf.DeviceID)
+	return err
 }
 
 // Dispatch a pod request to the request handler and return the result to the

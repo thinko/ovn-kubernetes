@@ -4,6 +4,9 @@
 package util
 
 import (
+	"fmt"
+	"path/filepath"
+
 	"github.com/k8snetworkplumbingwg/govdpa/pkg/kvdpa"
 )
 
@@ -13,6 +16,7 @@ type VdpaDevice interface {
 
 type VdpaOps interface {
 	GetVdpaDeviceByPci(pciAddress string) (kvdpa.VdpaDevice, error)
+	GetVduseVdpaDevice(device string) (kvdpa.VdpaDevice, error)
 }
 
 type defaultVdpaOps struct {
@@ -37,4 +41,24 @@ func (v *defaultVdpaOps) GetVdpaDeviceByPci(pciAddress string) (kvdpa.VdpaDevice
 		return vdpaDevices[0], nil
 	}
 	return nil, err
+}
+
+func (v *defaultVdpaOps) GetVduseVdpaDevice(name string) (kvdpa.VdpaDevice, error) {
+	// Look up vdpa devices directly, which uses /sys, instead of looking up the VDUSE
+	// device first which would require /dev to be mounted.
+	vdpaDevices, err := kvdpa.GetVdpaDevicesByMgmtDev("", "vduse")
+	if err != nil {
+		return nil, err
+	}
+
+	for _, dev := range vdpaDevices {
+		parent, err := dev.ParentDevicePath()
+		if err != nil {
+			return nil, err
+		}
+		if filepath.Base(parent) == name {
+			return dev, nil
+		}
+	}
+	return nil, fmt.Errorf("vduse vdpa device %s not found", name)
 }

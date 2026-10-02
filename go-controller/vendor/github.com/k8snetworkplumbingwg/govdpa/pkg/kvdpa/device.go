@@ -1,6 +1,7 @@
 package kvdpa
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -17,9 +18,10 @@ const (
 
 // Private constants
 const (
-	vdpaBusDevDir   = "/sys/bus/vdpa/devices"
-	vdpaVhostDevDir = "/dev"
-	rootDevDir      = "/sys/devices"
+	vdpaBusDevDir    = "/sys/bus/vdpa/devices"
+	vdpaBusDriverDir = "/sys/bus/vdpa/drivers"
+	vdpaVhostDevDir  = "/dev"
+	rootDevDir       = "/sys/devices"
 )
 
 // VdpaDevice contains information about a Vdpa Device
@@ -27,18 +29,17 @@ type VdpaDevice interface {
 	Driver() string
 	Name() string
 	MgmtDev() MgmtDev
-	VirtioNet() VirtioNet
-	VhostVdpa() VhostVdpa
+	VirtioNet() (VirtioNet, error)
+	VhostVdpa() (VhostVdpa, error)
+	Bind(string) error
 	ParentDevicePath() (string, error)
 }
 
 // vdpaDev implements VdpaDevice interface
 type vdpaDev struct {
-	name      string
-	driver    string
-	mgmtDev   *mgmtDev
-	virtioNet VirtioNet
-	vhostVdpa VhostVdpa
+	name    string
+	driver  string
+	mgmtDev *mgmtDev
 }
 
 // Driver resturns de device's driver name
@@ -57,15 +58,37 @@ func (vd *vdpaDev) MgmtDev() MgmtDev {
 }
 
 // VhostVdpa returns the VhostVdpa device information associated
-// or nil if the device is not bound to the vhost_vdpa driver
-func (vd *vdpaDev) VhostVdpa() VhostVdpa {
-	return vd.vhostVdpa
+// or nil if the device is not bound to the vhost_vdpa driver.
+// It requires access to /dev
+func (vd *vdpaDev) VhostVdpa() (VhostVdpa, error) {
+	return vd.getVhostVdpaDev()
 }
 
 // Virtionet returns the VirtioNet device information associated
 // or nil if the device is not bound to the virtio_vdpa driver
-func (vd *vdpaDev) VirtioNet() VirtioNet {
-	return vd.virtioNet
+func (vd *vdpaDev) VirtioNet() (VirtioNet, error) {
+	return vd.getVirtioVdpaDev()
+}
+
+// Bind a specific driver (if not already bound)
+func (vd *vdpaDev) Bind(driver string) error {
+	if vd.Driver() == driver {
+		return nil
+	}
+
+	if vd.Driver() != "" {
+		unbind := filepath.Join(vdpaBusDevDir, vd.name, "driver", "unbind")
+		err := os.WriteFile(unbind, []byte(fmt.Sprintf("%s\n", vd.name)), os.FileMode(os.O_SYNC))
+		if err != nil {
+			return err
+		}
+	}
+	bind := filepath.Join(vdpaBusDriverDir, driver, "bind")
+	err := os.WriteFile(bind, []byte(fmt.Sprintf("%s\n", vd.name)), os.FileMode(os.O_SYNC))
+	if err != nil {
+		return err
+	}
+	return vd.getBusInfo()
 }
 
 // getBusInfo populates the vdpa bus information
@@ -78,19 +101,6 @@ func (vd *vdpaDev) getBusInfo() error {
 	}
 
 	vd.driver = filepath.Base(driverLink)
-
-	switch vd.driver {
-	case VhostVdpaDriver:
-		vd.vhostVdpa, err = vd.getVhostVdpaDev()
-		if err != nil {
-			return err
-		}
-	case VirtioVdpaDriver:
-		vd.virtioNet, err = vd.getVirtioVdpaDev()
-		if err != nil {
-			return err
-		}
-	}
 
 	return nil
 }
@@ -124,7 +134,7 @@ func (vd *vdpaDev) ParentDevicePath() (string, error) {
 	vdpaDevicePath := filepath.Join(vdpaBusDevDir, vd.name)
 
 	/* For pci devices we have:
-	/sys/bud/vdpa/devices/vdpaX ->
+	/sys/bus/vdpa/devices/vdpaX ->
 	    ../../../devices/pci0000:00/.../0000:05:00:1/vdpaX
 
 	Resolving the symlinks should give us the parent PCI device.
@@ -163,11 +173,14 @@ We also check the virtio device exists in the virtio bus:
 	virtio{N} -> ../../../devices/pci0000:00/0000:00:03.2/0000:05:00.2/virtio{N}
 */
 func (vd *vdpaDev) getVirtioVdpaDev() (VirtioNet, error) {
-	parentPath, err := vd.ParentDevicePath()
-	if err != nil {
-		return nil, err
+	if vd.mgmtDev.BusName() == "pci" {
+		parentPath, err := vd.ParentDevicePath()
+		if err != nil {
+			return nil, err
+		}
+		return GetVirtioNetInPath(parentPath)
 	}
-	return GetVirtioNetInPath(parentPath)
+	return GetVirtioNetInPath(filepath.Join(vdpaBusDevDir, vd.name))
 }
 
 /*GetVdpaDevice returns the vdpa device information by a vdpa device name */

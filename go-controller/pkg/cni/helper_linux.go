@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"net"
 	"os"
 	"runtime"
@@ -24,7 +25,9 @@ import (
 	"github.com/safchain/ethtool"
 	"github.com/vishvananda/netlink"
 
+	"github.com/k8snetworkplumbingwg/govdpa/pkg/kvdpa"
 	"k8s.io/klog/v2"
+	kexec "k8s.io/utils/exec"
 	"sigs.k8s.io/knftables"
 
 	"github.com/ovn-kubernetes/libovsdb/client"
@@ -67,6 +70,51 @@ func replaceRouteECMP(ipn *net.IPNet, gw net.IP, devs []netlink.Link, mtu int) e
 const udpPacketAggregationTimeout = 50 * time.Microsecond
 
 var udpPacketAggregationTimeoutBytes = []byte(fmt.Sprintf("%d\n", udpPacketAggregationTimeout.Nanoseconds()))
+
+func disableTxChecksumming(ifname string) error {
+	e, err := ethtool.NewEthtool()
+	if err != nil {
+		return fmt.Errorf("failed to initialize ethtool: %v", err)
+	}
+	defer e.Close()
+
+	features, err := e.Features(ifname)
+	if err != nil {
+		return fmt.Errorf("could not list interface features: %v", err)
+	}
+
+	changes := make(map[string]bool)
+	for featureName, toEnable := range map[string]bool{
+		"tx-checksum-ipv4":             false,
+		"tx-checksum-ip-generic":       false,
+		"tx-checksum-ipv6":             false,
+		"tx-checksum-fcoe-crc":         false,
+		"tx-checksum-sctp":             false,
+		"tx-tcp-segmentation":          false,
+		"tx-tcp-ecn-segmentation":      false,
+		"tx-tcp-mangleid-segmentation": false,
+		"tx-tcp6-segmentation":         false,
+		"tx-generic-segmentation":      false,
+		"rx-gro":                       false,
+		"rx-udp-gro-forwarding":        false,
+	} {
+		isEnabled, exists := features[featureName]
+		if exists && isEnabled != toEnable {
+			changes[featureName] = toEnable
+		}
+	}
+
+	if len(changes) == 0 {
+		return nil
+	}
+
+	err = e.Change(ifname, changes)
+	if err != nil {
+		return fmt.Errorf("could not disable interface features: %v", err)
+	}
+
+	return nil
+}
 
 // sets up the host side of a veth for UDP packet aggregation
 func setupVethUDPAggregationHost(ifname string) error {
@@ -301,6 +349,132 @@ func setupNetwork(link netlink.Link, ifInfo *PodInterfaceInfo) error {
 	}
 
 	return nil
+}
+
+func prepareVDUSEInterfaceName(containerID, netName string) (string, error) {
+	// NOTE: Name must be reproducable otherwise device cannot be identified reliably during UnconfigureInterface!
+
+	if netName == types.DefaultNetworkName {
+		return containerID[:15], nil
+	}
+
+	// Use hash of name of secondary network to derive interface name
+
+	h := fnv.New32a()
+	_, err := h.Write([]byte(netName))
+	if err != nil {
+		return "", fmt.Errorf("failed to hash %s while generating vduse name: %v", netName, err)
+	}
+
+	suffix := fmt.Sprintf("_%d", h.Sum32())
+	return containerID[:(15-len(suffix))] + suffix, nil
+}
+
+func setupVDUSEInterface(netns ns.NetNS, containerID, ifName string, ifInfo *PodInterfaceInfo, hostIfaceName string, deviceType DeviceType) (*current.Interface, *current.Interface, error) {
+	hostIface := &current.Interface{}
+	contIface := &current.Interface{}
+
+	hostIface.Name = hostIfaceName
+
+	if deviceType == DeviceTypeVDUSEVhost {
+		// For vhost-vdpa devices, we don't need to configure anything else.
+		contIface.Name = ifName
+		contIface.Mac = ifInfo.MAC.String()
+		contIface.Sandbox = netns.Path()
+		return hostIface, contIface, nil
+	}
+
+	vdpaArgs := []string{
+		"dev", "add", "name", hostIfaceName, "mgmtdev", "vduse",
+	}
+
+	runner := kexec.New()
+	output, err := runner.Command("vdpa", vdpaArgs...).CombinedOutput()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to attach %s to vDPA bus: %s\n  %s", hostIfaceName, err, output)
+	}
+
+	vdpaDev, err := kvdpa.GetVdpaDevice(hostIfaceName)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to retrieve vdpa device %s: %w", hostIfaceName, err)
+	}
+	if err := vdpaDev.Bind(kvdpa.VirtioVdpaDriver); err != nil {
+		return nil, nil, fmt.Errorf("failed to bind vdpa device to virtio_vdpa driver %s: %w", hostIfaceName, err)
+	}
+
+	virtio_net, err := vdpaDev.VirtioNet()
+	if err != nil || virtio_net == nil || virtio_net.NetDev() == "" {
+		return nil, nil, fmt.Errorf("failed to read netdev for vduse device %s", hostIfaceName)
+	}
+	vdpaNetDevName := virtio_net.NetDev()
+
+	contNetDevName, err := safeMoveIfToNetns(vdpaNetDevName, netns, containerID)
+	if err != nil {
+		return nil, nil, fmt.Errorf(
+			"failed to move netdev %s for vduse device %s to net ns %s: %s", vdpaNetDevName, hostIfaceName, netns, err)
+	}
+
+	err = netns.Do(func(hostNS ns.NetNS) error {
+		err = renameLink(contNetDevName, ifName)
+		if err != nil {
+			return fmt.Errorf("failed to rename netdev %s to %s for vduse device %s: %v",
+				contNetDevName, ifName, hostIfaceName, err)
+		}
+
+		contLink, err := netlink.LinkByName(ifName)
+		if err != nil {
+			return fmt.Errorf("failed to lookup netdev %s for vduse device %s: %v",
+				ifName, hostIfaceName, err)
+		}
+
+		err = util.GetNetLinkOps().LinkSetHardwareAddr(contLink, ifInfo.MAC)
+		if err != nil {
+			return fmt.Errorf("failed to set mac address %s for netdev %s / vduse device %s: %v", ifInfo.MAC, ifName, hostIfaceName, err)
+		}
+
+		err = util.GetNetLinkOps().LinkSetMTU(contLink, ifInfo.MTU)
+		if err != nil {
+			return fmt.Errorf("failed to set MTU %d for netdev %s / vduse device %s: %v", ifInfo.MTU, ifName, hostIfaceName, err)
+		}
+
+		err = netlink.LinkSetUp(contLink)
+		if err != nil {
+			return fmt.Errorf("failed to enable netdev %s / vduse device %s: %v", ifName, hostIfaceName, err)
+		}
+
+		err = setupNetwork(contLink, ifInfo)
+		if err != nil {
+			return fmt.Errorf("failed to set up network for netdev %s / vduse device %s: %v", ifName, hostIfaceName, err)
+		}
+
+		err = disableTxChecksumming(ifName)
+		if err != nil {
+			return fmt.Errorf("could not disable TX checksumming on container vduse interface %q: %v", ifName, err)
+		}
+
+		// Refresh mac address for netdev
+		contLink, err = netlink.LinkByName(ifName)
+		if err != nil {
+			return fmt.Errorf("failed to refresh attrs for netdev %s (vduse device %s): %v", ifName, hostIfaceName, err)
+		}
+
+		contLinkAddrs := contLink.Attrs()
+		contIface.Name = contLinkAddrs.Name
+
+		contIface.Mac = contLinkAddrs.HardwareAddr.String()
+		if !strings.EqualFold(contIface.Mac, ifInfo.MAC.String()) {
+			return fmt.Errorf("unexpected configuration, container netdev mac %s is not what it is supposed to be: %s",
+				contIface.Mac, ifInfo.MAC.String())
+		}
+		contIface.Sandbox = netns.Path()
+
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return hostIface, contIface, nil
 }
 
 func setupInterface(netns ns.NetNS, containerID, ifName string, ifInfo *PodInterfaceInfo) (*current.Interface, *current.Interface, error) {
@@ -608,10 +782,15 @@ func getExistingIfaceMeta(ovsClient client.Client, name string) (string, string,
 // NADExternalID left by a previous owner. If useDPDK is true the Interface
 // type is set to dpdk with mtu_request=mtu.
 func addOrUpdatePodPort(ovsClient client.Client, hostIfaceName string,
-	extIDs map[string]string, useDPDK bool, mtu int, stripDefaultNetIDs bool) error {
+	extIDs map[string]string, useDPDK, isVDUSE bool, vduseDevName string, mtu int, stripDefaultNetIDs bool) error {
 	if ovsClient != nil {
 		iface := &vswitchd.Interface{ExternalIDs: extIDs}
-		if useDPDK {
+		if isVDUSE {
+			iface.Type = "dpdkvhostuserclient"
+			iface.Options = map[string]string{
+				"vhost-server-path": fmt.Sprintf("/dev/vduse/%s", vduseDevName),
+			}
+		} else if useDPDK {
 			m := mtu
 			iface.Type = "dpdk"
 			iface.MTURequest = &m
@@ -656,7 +835,9 @@ func addOrUpdatePodPort(ovsClient client.Client, hostIfaceName string,
 			args = append(args, fmt.Sprintf("external_ids:%s=%s", k, v))
 		}
 	}
-	if useDPDK {
+	if isVDUSE {
+		args = append(args, "type=dpdkvhostuserclient", fmt.Sprintf("options:vhost-server-path=/dev/vduse/%s", vduseDevName))
+	} else if useDPDK {
 		args = append(args, "type=dpdk", fmt.Sprintf("mtu_request=%v", mtu))
 	}
 	if stripDefaultNetIDs {
@@ -674,7 +855,7 @@ func addOrUpdatePodPort(ovsClient client.Client, hostIfaceName string,
 // libovsdb; when nil (unprivileged CNI shim path) it falls back to ovs-vsctl
 // shell-outs.
 func ConfigureOVS(ctx context.Context, ovsClient client.Client, namespace, podName, podIfName, hostIfaceName string,
-	ifInfo *PodInterfaceInfo, sandboxID, deviceID string, isVFIO bool, getter PodInfoGetter) error {
+	ifInfo *PodInterfaceInfo, sandboxID, deviceID string, getter PodInfoGetter, isVDUSE, isDOCA bool, deviceType DeviceType) error {
 
 	ifaceID := util.GetIfaceId(namespace, podName)
 	if ifInfo.NetName != types.DefaultNetworkName {
@@ -691,8 +872,8 @@ func ConfigureOVS(ctx context.Context, ovsClient client.Client, namespace, podNa
 		return err
 	}
 
-	klog.Infof("ConfigureOVS: namespace: %s, podName: %s, hostIfaceName: %s, network: %s, NAD %s, SandboxID: %q, PCI device ID: %s, UID: %q, MAC: %s, IPs: %v",
-		namespace, podName, hostIfaceName, ifInfo.NetName, ifInfo.NADKey, sandboxID, deviceID, initialPodUID, ifInfo.MAC, ipStrs)
+	klog.Infof("ConfigureOVS: namespace: %s, podName: %s, hostIfaceName: %s, network: %s, NAD %s, SandboxID: %q, PCI device ID: %s, UID: %q, MAC: %s, IPs: %v, isVDUSE: %v, isDOCA: %v",
+		namespace, podName, hostIfaceName, ifInfo.NetName, ifInfo.NADKey, sandboxID, deviceID, initialPodUID, ifInfo.MAC, ipStrs, isVDUSE, isDOCA)
 
 	// Find and remove any existing OVS port with this iface-id. Pods can
 	// have multiple sandboxes if some are waiting for garbage collection,
@@ -750,14 +931,31 @@ func ConfigureOVS(ctx context.Context, ovsClient client.Client, namespace, podNa
 
 	useDPDK := false
 	if dpType == types.DatapathUserspace {
-		if _, err := util.GetSriovnetOps().GetRepresentorPortFlavour(hostIfaceName); err != nil {
-			// The error is not important: the given port is not a switchdev one and won't
-			// be used with DPDK. It can happen for legitimate reason. Keep a trace of the
-			// event and continue configuring OVS.
-			klog.Infof("Port %s cannot be used with DPDK, will use netlink interface in OVS",
-				hostIfaceName)
+		if isDOCA {
+			if _, err := util.GetSriovnetOps().GetRepresentorPortFlavour(hostIfaceName); err != nil {
+				klog.Infof("Port %s cannot be used with DOCA, will use netlink interface in OVS",
+					hostIfaceName)
+			} else {
+				useDPDK = true
+			}
+		} else if !isVDUSE {
+			if _, err := util.GetSriovnetOps().GetRepresentorPortFlavour(hostIfaceName); err != nil {
+				klog.Infof("Port %s cannot be used with DPDK, will use netlink interface in OVS",
+					hostIfaceName)
+			} else {
+				useDPDK = true
+			}
+		}
+	}
+
+	var vduseDevName string = ""
+	if isVDUSE {
+		if deviceType == DeviceTypeVDUSEVhost {
+			// vhost_vdpa
+			vduseDevName = deviceID
 		} else {
-			useDPDK = true
+			// virtio_vdpa
+			vduseDevName = hostIfaceName
 		}
 	}
 
@@ -766,7 +964,7 @@ func ConfigureOVS(ctx context.Context, ovsClient client.Client, namespace, podNa
 		// Review this line when upgrade mechanism will be implemented
 		extIDs["vf-netdev-name"] = ifInfo.NetdevName
 	}
-	if isVFIO {
+	if deviceType == DeviceTypeVFIO {
 		// VFIO case
 		extIDs["vf-is-vfio"] = "true"
 	}
@@ -781,7 +979,7 @@ func ConfigureOVS(ctx context.Context, ovsClient client.Client, namespace, podNa
 		stripDefaultNetIDs = true
 	}
 
-	if err := addOrUpdatePodPort(ovsClient, hostIfaceName, extIDs, useDPDK, ifInfo.MTU, stripDefaultNetIDs); err != nil {
+	if err := addOrUpdatePodPort(ovsClient, hostIfaceName, extIDs, useDPDK, isVDUSE, vduseDevName, ifInfo.MTU, stripDefaultNetIDs); err != nil {
 		return err
 	}
 
@@ -790,13 +988,13 @@ func ConfigureOVS(ctx context.Context, ovsClient client.Client, namespace, podNa
 	}
 
 	var link netlink.Link
-	if deviceID != "" || (ifInfo.Ingress > 0 || ifInfo.Egress > 0) {
+	if (deviceID != "" || (ifInfo.Ingress > 0 || ifInfo.Egress > 0)) && !isVDUSE {
 		if link, err = util.GetNetLinkOps().LinkByName(hostIfaceName); err != nil {
 			return fmt.Errorf("failed to find interface %s: %v", hostIfaceName, err)
 		}
 	}
 
-	if deviceID != "" {
+	if deviceID != "" && !isVDUSE {
 		// 4. set MTU on the representor
 		if err = util.GetNetLinkOps().LinkSetMTU(link, ifInfo.MTU); err != nil {
 			return fmt.Errorf("failed to set MTU on %s: %v", hostIfaceName, err)
@@ -808,7 +1006,7 @@ func ConfigureOVS(ctx context.Context, ovsClient client.Client, namespace, podNa
 		}
 	}
 
-	if ifInfo.Ingress > 0 || ifInfo.Egress > 0 {
+	if (ifInfo.Ingress > 0 || ifInfo.Egress > 0) && !isVDUSE {
 		err = netlink.LinkSetTxQLen(link, 1000)
 		if err != nil {
 			return fmt.Errorf("failed to set host veth txqlen: %v", err)
@@ -819,12 +1017,14 @@ func ConfigureOVS(ctx context.Context, ovsClient client.Client, namespace, podNa
 		}
 	}
 
-	if err := waitForPodInterface(ctx, ovsClient, ifInfo, hostIfaceName, ifaceID, getter,
-		namespace, podName, initialPodUID); err != nil {
-		// Ensure the error shows up in node logs, rather than just
-		// being reported back to the runtime.
-		klog.Warningf("[%s/%s %s] pod uid %s: %v", namespace, podName, sandboxID, initialPodUID, err)
-		return err
+	if !isVDUSE {
+		if err := waitForPodInterface(ctx, ovsClient, ifInfo, hostIfaceName, ifaceID, getter,
+			namespace, podName, initialPodUID); err != nil {
+			// Ensure the error shows up in node logs, rather than just
+			// being reported back to the runtime.
+			klog.Warningf("[%s/%s %s] pod uid %s: %v", namespace, podName, sandboxID, initialPodUID, err)
+			return err
+		}
 	}
 	return nil
 }
@@ -846,23 +1046,84 @@ func (*defaultPodRequestInterfaceOps) ConfigureInterface(pr *PodRequest, ovsClie
 	}
 	defer netns.Close()
 
+	stdout, err := ovsGet("Open_vSwitch", ".", "other_config", "dpdk-init")
+	if err != nil {
+		return nil, fmt.Errorf("failed to get OVS' other_config:dpdk-init, error: %v", err)
+	}
+	ovsDPDKInit := (stdout == "true")
+
+	stdout, err = ovsGet("Open_vSwitch", ".", "other_config", "doca-init")
+	if err != nil {
+		return nil, fmt.Errorf("failed to get OVS' other_config:doca-init, error: %v", err)
+	}
+	ovsDOCAInit := (stdout == "true")
+
+	dpType, err := getBrIntDatapathType(ovsClient)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get datapath type for bridge br-int : %v", err)
+	}
+
+	if dpType != types.DatapathSystem && dpType != types.DatapathUserspace {
+		return nil, fmt.Errorf("br-int has unknown datapath type: %v", dpType)
+	}
+
+	if dpType == types.DatapathUserspace && ifInfo.IsDPUHostMode {
+		return nil, fmt.Errorf("unexpected configuration, pod request on dpu host with netdev datapath")
+	}
+
+	isVDUSE := ovsDPDKInit && (dpType == types.DatapathUserspace)
+	isDOCA := ovsDOCAInit && (dpType == types.DatapathUserspace)
+
+	if isVDUSE && isDOCA {
+		return nil, fmt.Errorf("unexpected configuration, both VDUSE and DOCA are enabled")
+	}
+
 	var hostIface, contIface *current.Interface
+	var hostIfName string
 
 	klog.V(5).Infof("CNI Conf %v", pr.CNIConf)
-	if pr.CNIConf.DeviceID != "" {
-		// SR-IOV Case
-		hostIface, contIface, err = setupSriovInterface(netns, pr.SandboxID, pr.IfName, ifInfo, pr.CNIConf.DeviceID, pr.IsVFIO)
-	} else {
+	switch pr.DeviceType {
+	case DeviceTypeNotSupported:
+		return nil, fmt.Errorf("device type not supported: %s", pr.CNIConf.DeviceID)
+	case DeviceTypeNone:
 		if ifInfo.IsDPUHostMode {
 			return nil, fmt.Errorf("unexpected configuration, pod request on dpu host. " +
 				"device ID must be provided")
 		}
 
 		// General case
-		hostIface, contIface, err = setupInterface(netns, pr.SandboxID, pr.IfName, ifInfo)
-	}
-	if err != nil {
-		return nil, err
+		if dpType == types.DatapathSystem {
+			// Veth
+			hostIface, contIface, err = setupInterface(netns, pr.SandboxID, pr.IfName, ifInfo)
+			if err != nil {
+				return nil, err
+			}
+			hostIfName = hostIface.Name
+		} else if isVDUSE {
+			// VDUSE
+			hostIfName, err = prepareVDUSEInterfaceName(pr.SandboxID, ifInfo.NetName)
+			if err != nil {
+				return nil, err
+			}
+			klog.V(5).Infof("Creating vduse dev %s (pr.netName: %s, ifInfo.NetName: %s)", hostIfName, pr.netName, ifInfo.NetName)
+		}
+	case DeviceTypeVDUSEVhost:
+		hostIfName, err = prepareVDUSEInterfaceName(pr.SandboxID, ifInfo.NetName)
+		if err != nil {
+			return nil, err
+		}
+		klog.V(5).Infof("Creating vduse vhost dev %s (pr.netName: %s, ifInfo.NetName: %s)", hostIfName, pr.netName, ifInfo.NetName)
+	default:
+		// SR-IOV Case
+		if dpType != types.DatapathSystem {
+			return nil, fmt.Errorf("SR-IOV not supported with datapath type %v", dpType)
+		}
+
+		hostIface, contIface, err = setupSriovInterface(netns, pr.SandboxID, pr.IfName, ifInfo, pr.CNIConf.DeviceID, pr.DeviceType == DeviceTypeVFIO)
+		if err != nil {
+			return nil, err
+		}
+		hostIfName = hostIface.Name
 	}
 
 	// OCP HACK: block access to MCS/metadata; https://github.com/openshift/ovn-kubernetes/pull/19
@@ -876,9 +1137,26 @@ func (*defaultPodRequestInterfaceOps) ConfigureInterface(pr *PodRequest, ovsClie
 	// END OCP HACK
 
 	if !ifInfo.IsDPUHostMode {
-		err = ConfigureOVS(pr.ctx, ovsClient, pr.PodNamespace, pr.PodName, pr.IfName, hostIface.Name, ifInfo, pr.SandboxID, pr.CNIConf.DeviceID, pr.IsVFIO, getter)
+		err = ConfigureOVS(pr.ctx, ovsClient, pr.PodNamespace, pr.PodName, pr.IfName, hostIfName, ifInfo, pr.SandboxID, pr.CNIConf.DeviceID, getter, isVDUSE, isDOCA, pr.DeviceType)
+		if err == nil && isVDUSE {
+			hostIface, contIface, err = setupVDUSEInterface(netns, pr.SandboxID, pr.IfName, ifInfo, hostIfName, pr.DeviceType)
+		}
+
+		if err == nil && isVDUSE {
+			ifaceID := util.GetIfaceId(pr.PodNamespace, pr.PodName)
+			if ifInfo.NetName != types.DefaultNetworkName {
+				ifaceID = util.GetUDNIfaceId(pr.PodNamespace, pr.PodName, ifInfo.NADKey)
+			}
+			err = waitForPodInterface(pr.ctx, ovsClient, ifInfo, hostIfName, ifaceID, getter, pr.PodNamespace, pr.PodName, ifInfo.PodUID)
+			if err != nil {
+				// Ensure the error shows up in node logs, rather than just
+				// being reported back to the runtime.
+				klog.Warningf("[%s/%s %s] pod uid %s: %v", pr.PodNamespace, pr.PodName, pr.SandboxID, ifInfo.PodUID, err)
+			}
+		}
+
 		if err != nil {
-			pr.deletePort(hostIface.Name, pr.PodNamespace, pr.PodName)
+			pr.deletePort(hostIfName, pr.PodNamespace, pr.PodName, pr.DeviceType, pr.CNIConf.DeviceID, isVDUSE)
 			return nil, err
 		}
 	}
@@ -900,7 +1178,7 @@ func (*defaultPodRequestInterfaceOps) ConfigureInterface(pr *PodRequest, ovsClie
 			break
 		}
 	}
-	if haveV6 && !pr.IsVFIO {
+	if haveV6 && pr.DeviceType.HasNetdev() {
 		err = netns.Do(func(_ ns.NetNS) error {
 			// deny IPv6 neighbor solicitations
 			dadSysctlIface := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/dad_transmits", contIface.Name)
@@ -932,13 +1210,35 @@ func (*defaultPodRequestInterfaceOps) ConfigureInterface(pr *PodRequest, ovsClie
 func (*defaultPodRequestInterfaceOps) UnconfigureInterface(pr *PodRequest, ifInfo *PodInterfaceInfo) error {
 	podDesc := fmt.Sprintf("for pod %s/%s NAD %s", pr.PodNamespace, pr.PodName, pr.nadName)
 	klog.V(5).Infof("Tear down interface (%+v) %s", *pr, podDesc)
+
+	stdout, err := ovsGet("Open_vSwitch", ".", "other_config", "dpdk-init")
+	if err != nil {
+		return fmt.Errorf("failed to get OVS' other_config:dpdk-init, error: %v", err)
+	}
+	ovsDPDKInit := (stdout == "true")
+
+	dpType, err := getDatapathType("br-int")
+	if err != nil {
+		return fmt.Errorf("failed to get datapath type for bridge br-int : %v", err)
+	}
+
+	if dpType != types.DatapathSystem && dpType != types.DatapathUserspace {
+		return fmt.Errorf("br-int has unknown datapath type: %v", dpType)
+	}
+
+	if dpType == types.DatapathUserspace && ifInfo.IsDPUHostMode {
+		return fmt.Errorf("unexpected configuration, pod request on dpu host with netdev datapath")
+	}
+
+	isVDUSE := ovsDPDKInit && (dpType == types.DatapathUserspace)
+
 	if ifInfo.IsDPUHostMode {
 		if pr.CNIConf.DeviceID == "" {
 			klog.Warningf("Unexpected configuration %s, pod request on DPU host. device ID must be provided", podDesc)
 			return nil
 		}
 		// nothing else to do in DPUHostMode for VFIO device
-		if pr.IsVFIO {
+		if pr.DeviceType == DeviceTypeVFIO {
 			return nil
 		}
 		// in the case of VF, we need to rename the container interface to VF name and move it to host
@@ -947,7 +1247,7 @@ func (*defaultPodRequestInterfaceOps) UnconfigureInterface(pr *PodRequest, ifInf
 	ifnameSuffix := ""
 	isSecondary := pr.netName != types.DefaultNetworkName
 	// nothing needs to be done for the VFIO case in the container namespace
-	if !pr.IsVFIO {
+	if (pr.DeviceType != DeviceTypeVFIO) && (dpType != types.DatapathUserspace) {
 		netns, err := ns.GetNS(pr.Netns)
 		if err != nil {
 			return fmt.Errorf("failed to get container namespace %s: %v", podDesc, err)
@@ -1008,9 +1308,17 @@ func (*defaultPodRequestInterfaceOps) UnconfigureInterface(pr *PodRequest, ifInf
 		var err error
 		// host side interface deletion
 		var hostIfName string
-		if !util.IsNetworkSegmentationSupportEnabled() || isSecondary {
-			// this is a secondary network (not primary) or segmentation is not enabled
-			hostIfName = pr.SandboxID[:(15-len(ifnameSuffix))] + ifnameSuffix
+		if isVDUSE {
+			hostIfName, err = prepareVDUSEInterfaceName(pr.SandboxID, pr.netName)
+			if err != nil {
+				klog.Errorf("Failed to regenerate vduse device name for pod %s: %v", podDesc, err)
+			}
+			klog.V(5).Infof("Removing vduse dev %s (pr.netName: %s, ifInfo.NetName: %s)", hostIfName, pr.netName, ifInfo.NetName)
+		} else {
+			if !util.IsNetworkSegmentationSupportEnabled() || isSecondary {
+				// this is a secondary network (not primary) or segmentation is not enabled
+				hostIfName = pr.SandboxID[:(15-len(ifnameSuffix))] + ifnameSuffix
+			}
 		}
 		if pr.CNIConf.DeviceID != "" {
 			hostIfName, err = util.GetFunctionRepresentorName(pr.CNIConf.DeviceID)
@@ -1027,7 +1335,7 @@ func (*defaultPodRequestInterfaceOps) UnconfigureInterface(pr *PodRequest, ifInf
 		// hostIfName is not empty if using device ID, a secondary network, or segmentation not enabled
 		// delete the port in traditional fashion
 		if hostIfName != "" {
-			pr.deletePort(hostIfName, pr.PodNamespace, pr.PodName)
+			pr.deletePort(hostIfName, pr.PodNamespace, pr.PodName, pr.DeviceType, pr.CNIConf.DeviceID, isVDUSE)
 		} else {
 			// this is a primary interface deletion and segmentation is enabled, delete all ports
 			// delete happens in reverse order for attached networks, so this is the final deletion
@@ -1037,7 +1345,7 @@ func (*defaultPodRequestInterfaceOps) UnconfigureInterface(pr *PodRequest, ifInf
 				klog.V(5).Infof("Removing multiple interfaces for primary network segmentation (%+v) %s: %s",
 					*pr, podDesc, strings.Join(portList, ","))
 			}
-			pr.deletePorts(portList, pr.PodNamespace, pr.PodName)
+			pr.deletePorts(portList, pr.PodNamespace, pr.PodName, pr.DeviceType, pr.CNIConf.DeviceID, isVDUSE)
 		}
 		err = clearPodBandwidthForPorts(portList, pr.SandboxID)
 		if err != nil {
@@ -1075,13 +1383,33 @@ func (pr *PodRequest) deletePodConntrack() {
 	}
 }
 
-func (pr *PodRequest) deletePort(ifaceName, podNamespace, podName string) {
+func (pr *PodRequest) deletePort(ifaceName, podNamespace, podName string, deviceType DeviceType, deviceID string, isVDUSE bool) {
 	podDesc := fmt.Sprintf("%s/%s", podNamespace, podName)
+
+	if isVDUSE {
+		var vduseDevName string = ""
+		if deviceType == DeviceTypeVDUSEVhost {
+			// vhost_vdpa
+			vduseDevName = deviceID
+		} else {
+			// virtio_vdpa
+			vduseDevName = ifaceName
+
+			vdpaDev, err := util.GetVdpaOps().GetVduseVdpaDevice(vduseDevName)
+			if err != nil {
+				klog.Warningf("failure while retrieving vDPA device for VDUSE device %s for pod %q: %v", vduseDevName, podDesc, err)
+			} else if err := kvdpa.DeleteVdpaDevice(vdpaDev.Name()); err != nil {
+				klog.Warningf("failure while deleting vDPA device %s for VDUSE device %s for pod %q: %v", vdpaDev.Name(), vduseDevName, podDesc, err)
+			}
+		}
+	}
 
 	var isVFDevice bool
 	link, err := util.GetNetLinkOps().LinkByName(ifaceName)
 	if err != nil {
-		klog.Warningf("Failed to find host-side link %s for pod %q: %v", ifaceName, podDesc, err)
+		if !isVDUSE {
+			klog.Warningf("Failed to find host-side link %s for pod %q: %v", ifaceName, podDesc, err)
+		}
 	} else if pr.CNIConf.DeviceID != "" {
 		isVFDevice = true
 	}
@@ -1105,16 +1433,22 @@ func (pr *PodRequest) deletePort(ifaceName, podNamespace, podName string) {
 	}
 
 	// skip deleting representor ports
-	if link != nil && !isVFDevice {
-		if err = util.LinkDelete(ifaceName); err != nil {
-			klog.Warningf("Failed to delete pod %q interface %s: %v", podDesc, ifaceName, err)
+	if pr.CNIConf.DeviceID != "" {
+		return
+	}
+
+	if !isVDUSE {
+		if link != nil && !isVFDevice {
+			if err = util.LinkDelete(ifaceName); err != nil {
+				klog.Warningf("Failed to delete pod %q interface %s: %v", podDesc, ifaceName, err)
+			}
 		}
 	}
 }
 
-func (pr *PodRequest) deletePorts(ifaces []string, podNamespace, podName string) {
+func (pr *PodRequest) deletePorts(ifaces []string, podNamespace, podName string, deviceType DeviceType, deviceID string, isVDUSE bool) {
 	for _, iface := range ifaces {
-		pr.deletePort(iface, podNamespace, podName)
+		pr.deletePort(iface, podNamespace, podName, deviceType, deviceID, isVDUSE)
 	}
 }
 
