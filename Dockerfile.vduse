@@ -1,0 +1,25 @@
+#
+# OpenShift 4.21 OVN-Kubernetes with OVS-DPDK VDUSE support
+#
+ARG BASE_IMAGE=image-registry.openshift-image-registry.svc:5000/ovn-vduse-test/ovn-base:4.21
+
+FROM ${BASE_IMAGE}
+
+USER root
+
+# Replace standard ovnkube binaries with rebased OVS-DPDK VDUSE binaries
+COPY go-controller/_output/go/bin/ovnkube /usr/bin/ovnkube
+COPY go-controller/_output/go/bin/ovnkube-identity /usr/bin/ovnkube-identity
+COPY go-controller/_output/go/bin/ovn-kube-util /usr/bin/ovn-kube-util
+COPY go-controller/_output/go/bin/ovn-k8s-cni-overlay /usr/libexec/cni/ovn-k8s-cni-overlay
+COPY go-controller/_output/go/bin/hybrid-overlay-node /usr/bin/hybrid-overlay-node
+COPY go-controller/_output/go/bin/ovnkube-observ /usr/bin/ovnkube-observ
+COPY go-controller/_output/go/bin/ovnkube-trace /usr/bin/ovnkube-trace
+
+LABEL io.k8s.display-name="ovn kubernetes (OVS-DPDK VDUSE rebased on 4.21)" \
+      io.k8s.description="OpenShift Container Platform OVN-Kubernetes with OVS-DPDK VDUSE support" \
+      summary="OpenShift 4.21 OVN-Kubernetes with VDUSE support for high-performance pod datapaths" \
+      io.openshift.tags="openshift,networking,ovn,dpdk,vduse"
+
+WORKDIR /root
+ENTRYPOINT ["/root/ovnkube.sh"]

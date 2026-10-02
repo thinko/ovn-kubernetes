@@ -1,0 +1,69 @@
+version: 39
+jobs:
+- name: Build and Package
+  steps:
+  - !CheckoutStep
+    name: checkout
+    cloneCredential: !DefaultCredential {}
+    withLfs: false
+    withSubmodules: false
+    condition: ALL_PREVIOUS_STEPS_WERE_SUCCESSFUL
+  - !CommandStep
+    name: compile ovn-kubernetes binaries
+    runInContainer: true
+    image: golang:1.26-bookworm
+    interpreter: !ShellInterpreter
+      shell: bash
+      commands: |
+        set -euo pipefail
+        echo "=========================================================="
+        echo " Building OVN-Kubernetes with OVS-DPDK VDUSE for OCP 4.21"
+        echo "=========================================================="
+        go version
+        cd go-controller
+        make
+        echo "── Built Binaries ──"
+        ls -lh _output/go/bin/
+    useTTY: false
+    condition: ALL_PREVIOUS_STEPS_WERE_SUCCESSFUL
+  - !PublishArtifactStep
+    name: publish built binaries
+    artifacts: go-controller/_output/go/bin/*
+    condition: ALL_PREVIOUS_STEPS_WERE_SUCCESSFUL
+  - !CommandStep
+    name: build and push vduse container image
+    runInContainer: true
+    image: gcr.io/kaniko-project/executor:debug
+    interpreter: !ShellInterpreter
+      shell: sh
+      commands: |
+        set -e
+        cp /busybox/touch /kaniko/touch
+
+        REGISTRY="image-registry.openshift-image-registry.svc:5000"
+        NAMESPACE="ovn-vduse-test"
+        TAG="@build_number@"
+
+        TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+        mkdir -p /kaniko/.docker
+        cat > /kaniko/.docker/config.json <<DOCKERCFG
+        {"auths":{"${REGISTRY}":{"auth":"$(echo -n "serviceaccount:${TOKEN}" | base64 -w0)"}}}
+        DOCKERCFG
+
+        /kaniko/executor \
+          --context=dir://. \
+          --dockerfile=Dockerfile.vduse \
+          --destination=${REGISTRY}/${NAMESPACE}/ovn-kube-vduse:${TAG} \
+          --destination=${REGISTRY}/${NAMESPACE}/ovn-kube-vduse:4.21 \
+          --destination=${REGISTRY}/${NAMESPACE}/ovn-kube-vduse:latest \
+          --insecure \
+          --skip-tls-verify
+    useTTY: false
+    condition: ALL_PREVIOUS_STEPS_WERE_SUCCESSFUL
+  triggers:
+  - !BranchUpdateTrigger
+    branches: ovs-dpdk-vduse* main master
+  retryCondition: never
+  maxRetries: 1
+  retryDelay: 30
+  timeout: 3600
