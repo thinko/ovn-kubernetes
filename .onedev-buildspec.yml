@@ -56,6 +56,9 @@ jobs:
           --destination=${REGISTRY}/${NAMESPACE}/ovn-kube-vduse:${TAG} \
           --destination=${REGISTRY}/${NAMESPACE}/ovn-kube-vduse:4.21 \
           --destination=${REGISTRY}/${NAMESPACE}/ovn-kube-vduse:latest \
+          --ignore-path=/usr/bin/newuidmap \
+          --ignore-path=/usr/bin/newgidmap \
+          --ignore-var-run=true \
           --insecure \
           --skip-tls-verify
     useTTY: false
