@@ -90,7 +90,6 @@ func generateModelInfo(dbSchema ovsdb.DatabaseSchema, modelTypes map[string]refl
 	for tableName, tType := range modelTypes {
 		tableSchema := dbSchema.Table(tableName)
 		if tableSchema == nil {
-			errors = append(errors, fmt.Errorf("database Model contains model for table %s which is not present in schema", tableName))
 			continue
 		}
 

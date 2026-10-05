@@ -146,13 +146,7 @@ func NewInfo(tableName string, table *ovsdb.TableSchema, obj any) (*Info, error)
 		}
 		column := table.Column(colName)
 		if column == nil {
-			return nil, &ErrMapper{
-				objType:   objType.String(),
-				field:     field.Name,
-				fieldType: field.Type.String(),
-				fieldTag:  colName,
-				reason:    "Column does not exist in schema",
-			}
+			continue
 		}
 
 		// Perform schema-based type checking

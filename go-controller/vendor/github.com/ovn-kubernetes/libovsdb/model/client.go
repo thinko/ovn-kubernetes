@@ -83,7 +83,6 @@ func (db ClientDBModel) validate(schema ovsdb.DatabaseSchema) []error {
 	for tableName := range db.types {
 		tableSchema := schema.Table(tableName)
 		if tableSchema == nil {
-			errors = append(errors, fmt.Errorf("database model contains a model for table %s that does not exist in schema", tableName))
 			continue
 		}
 		model, err := db.newModel(tableName)

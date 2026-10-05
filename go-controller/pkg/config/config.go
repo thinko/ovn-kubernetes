@@ -1111,6 +1111,10 @@ var CommonFlags = []cli.Flag{
 		Usage:       "Adds multicast support. Valid only with ovnkube-controller mode.",
 		Destination: &EnableMulticast,
 	},
+	&cli.BoolFlag{
+		Name:  "enable-interconnect",
+		Usage: "DEPRECATED: interconnect is always enabled in 4.21",
+	},
 	// Logging options
 	&cli.IntFlag{
 		Name:        "loglevel",
