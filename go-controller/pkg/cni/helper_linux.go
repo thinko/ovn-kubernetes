@@ -389,22 +389,45 @@ func setupVDUSEInterface(netns ns.NetNS, containerID, ifName string, ifInfo *Pod
 	}
 
 	runner := kexec.New()
-	output, err := runner.Command("vdpa", vdpaArgs...).CombinedOutput()
+	var output []byte
+	var err error
+	for attempt := 0; attempt < 50; attempt++ {
+		output, err = runner.Command("vdpa", vdpaArgs...).CombinedOutput()
+		if err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to attach %s to vDPA bus: %s\n  %s", hostIfaceName, err, output)
 	}
 
-	vdpaDev, err := kvdpa.GetVdpaDevice(hostIfaceName)
+	var vdpaDev kvdpa.VdpaDevice
+	for attempt := 0; attempt < 30; attempt++ {
+		vdpaDev, err = kvdpa.GetVdpaDevice(hostIfaceName)
+		if err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to retrieve vdpa device %s: %w", hostIfaceName, err)
 	}
+
 	if err := vdpaDev.Bind(kvdpa.VirtioVdpaDriver); err != nil {
 		return nil, nil, fmt.Errorf("failed to bind vdpa device to virtio_vdpa driver %s: %w", hostIfaceName, err)
 	}
 
-	virtio_net, err := vdpaDev.VirtioNet()
+	var virtio_net kvdpa.VirtioNet
+	for attempt := 0; attempt < 40; attempt++ {
+		virtio_net, err = vdpaDev.VirtioNet()
+		if err == nil && virtio_net != nil && virtio_net.NetDev() != "" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	if err != nil || virtio_net == nil || virtio_net.NetDev() == "" {
-		return nil, nil, fmt.Errorf("failed to read netdev for vduse device %s", hostIfaceName)
+		return nil, nil, fmt.Errorf("failed to read netdev for vduse device %s: %v", hostIfaceName, err)
 	}
 	vdpaNetDevName := virtio_net.NetDev()
 
