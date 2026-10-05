@@ -19,6 +19,22 @@ type DatabaseModel struct {
 
 // NewDatabaseModel returns a new DatabaseModel
 func NewDatabaseModel(schema ovsdb.DatabaseSchema, client ClientDBModel) (DatabaseModel, []error) {
+	filteredTypes := make(map[string]reflect.Type)
+	for tName, tType := range client.types {
+		if schema.Table(tName) != nil {
+			filteredTypes[tName] = tType
+		}
+	}
+	client.types = filteredTypes
+
+	filteredIndexes := make(map[string][]ClientIndex)
+	for tName, idxList := range client.indexes {
+		if schema.Table(tName) != nil {
+			filteredIndexes[tName] = idxList
+		}
+	}
+	client.indexes = filteredIndexes
+
 	dbModel := &DatabaseModel{
 		Schema: schema,
 		client: client,
